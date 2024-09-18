@@ -36,88 +36,390 @@ using UnityEditorInternal;
 using UnityEngine;
 using Object = UnityEngine.Object;
 
+
 namespace SubjectNerd.Utilities
 {
-	[CustomEditor(typeof(UnityEngine.Object), true, isFallback = true)]
-	[CanEditMultipleObjects]
-	public class ReorderableArrayInspector : Editor
-	{
-		// Set this to true to turn every array in non custom inspectors into reorderable lists
-		private const bool LIST_ALL_ARRAYS = false;
+    [CustomEditor(typeof(Object), true, isFallback = true)]
+    [CanEditMultipleObjects]
+    public class ReorderableArrayInspector : Editor
+    {
+        public bool isSubEditor;
 
-		protected static string GetGrandParentPath(SerializedProperty property)
-		{
-			string parent = property.propertyPath;
-			int firstDot = property.propertyPath.IndexOf('.');
-			if (firstDot > 0)
-			{
-				parent = property.propertyPath.Substring(0, firstDot);
-			}
-			return parent;
-		}
+        private readonly GUILayoutOption uiExpandWidth = GUILayout.ExpandWidth(true);
+        private readonly GUILayoutOption uiWidth50 = GUILayout.Width(50);
+        private readonly GUIContent labelBtnCreate = new("Create");
 
-		protected static bool FORCE_INIT = false;
-		[DidReloadScripts]
-		private static void HandleScriptReload()
-		{
-			FORCE_INIT = true;
+        private readonly List<SortableListData> listIndex = new();
+        private readonly Dictionary<string, Editor> editableIndex = new();
 
-			EditorApplication.delayCall += () => { EditorApplication.delayCall += () => { FORCE_INIT = false; }; };
-		}
+        protected static bool FORCE_INIT = false;
 
-		private static GUIStyle styleHighlight;
+        private static GUIStyle styleHighlight;
+        private GUIStyle styleEditBox;
 
-		/// <summary>
-		/// Internal class that manages ReorderableLists for each reorderable
-		/// SerializedProperty in a SerializedObject's direct child
-		/// </summary>
-		protected class SortableListData
-		{
-			public string Parent { get; private set; }
-			public Func<int, string> ElementHeaderCallback = null;
+        protected bool alwaysDrawInspector = false;
+        protected bool isInitialized = false;
+        protected bool hasSortableArrays = false;
+        protected bool hasEditable = false;
 
-			private readonly Dictionary<string, ReorderableList> propIndex = new Dictionary<string, ReorderableList>();
-			private readonly Dictionary<string, Action<SerializedProperty, Object[]>> propDropHandlers = new Dictionary<string, Action<SerializedProperty, Object[]>>();
-			private readonly Dictionary<string, int> countIndex = new Dictionary<string, int>();
+        protected Dictionary<string, ContextMenuData> contextData = new();
+        // Set this to true to turn every array in non custom inspectors into reorderable lists
+        private const bool LIST_ALL_ARRAYS = false;
 
-			public SortableListData(string parent)
-			{
-				Parent = parent;
-			}
 
-			public void AddProperty(SerializedProperty property)
-			{
-				// Check if this property actually belongs to the same direct child
-				if (GetGrandParentPath(property).Equals(Parent) == false)
-					return;
+        protected static string GetGrandParentPath(SerializedProperty property)
+        {
+            var parent = property.propertyPath;
+            var firstDot = property.propertyPath.IndexOf('.');
 
-				ReorderableList propList = new ReorderableList(
-					property.serializedObject, property,
-					draggable: true, displayHeader: false,
-					displayAddButton: true, displayRemoveButton: true)
-				{
-					headerHeight = 5
-				};
+            if (firstDot > 0)
+            {
+                parent = property.propertyPath.Substring(0, firstDot);
+            }
 
-				propList.drawElementCallback = delegate (Rect rect, int index, bool active, bool focused)
-				{
-					SerializedProperty targetElement = property.GetArrayElementAtIndex(index);
+            return parent;
+        }
 
-					bool isExpanded = targetElement.isExpanded;
-					rect.height = EditorGUI.GetPropertyHeight(targetElement, GUIContent.none, isExpanded);
 
-					if (targetElement.hasVisibleChildren)
-						rect.xMin += 10;
+        [DidReloadScripts]
+        private static void HandleScriptReload()
+        {
+            FORCE_INIT = true;
 
-					// Get Unity to handle drawing each element
-					GUIContent propHeader = new GUIContent(targetElement.displayName);
-					if (ElementHeaderCallback != null)
-						propHeader.text = ElementHeaderCallback(index);
-					EditorGUI.PropertyField(rect, targetElement, propHeader, isExpanded);
+            EditorApplication.delayCall += () => { EditorApplication.delayCall += () => { FORCE_INIT = false; }; };
+        }
 
-					// If drawing the selected element, use it to set the element height
-					// Element height seems to control selected background
-#if UNITY_5_1 || UNITY_5_2
+
+        ~ReorderableArrayInspector()
+        {
+            listIndex.Clear();
+            //hasSortableArrays = false;
+            editableIndex.Clear();
+            //hasEditable = false;
+            isInitialized = false;
+        }
+
+
+        protected bool InspectorGUIStart(bool force = false)
+        {
+            // Not initialized, try initializing
+            if (hasSortableArrays && listIndex.Count == 0)
+            {
+                InitInspector();
+            }
+
+            if (hasEditable && editableIndex.Count == 0)
+            {
+                InitInspector();
+            }
+
+            // No sortable arrays or list index unintialized
+            var cannotDrawOrderable = hasSortableArrays == false || listIndex.Count == 0;
+            var cannotDrawEditable = hasEditable == false || editableIndex.Count == 0;
+
+            if (cannotDrawOrderable && cannotDrawEditable && force == false)
+            {
+                if (isSubEditor)
+                {
+                    DrawPropertiesExcluding(serializedObject, "m_Script");
+                }
+                else
+                {
+                    base.OnInspectorGUI();
+                }
+
+                DrawContextMenuButtons();
+
+                return false;
+            }
+
+            serializedObject.Update();
+
+            return true;
+        }
+
+
+        protected virtual void DrawInspector()
+        {
+            DrawPropertiesAll();
+        }
+
+
+        public override void OnInspectorGUI()
+        {
+            if (InspectorGUIStart(alwaysDrawInspector) == false)
+            {
+                return;
+            }
+
+            EditorGUI.BeginChangeCheck();
+
+            DrawInspector();
+
+            if (EditorGUI.EndChangeCheck())
+            {
+                serializedObject.ApplyModifiedProperties();
+                InitInspector(true);
+            }
+
+            DrawContextMenuButtons();
+        }
+
+
+        protected void IterateDrawProperty(SerializedProperty property, Func<IterControl> filter = null)
+        {
+            if (property.NextVisible(true))
+            {
+                // Remember depth iteration started from
+                var depth = property.Copy().depth;
+
+                do
+                {
+                    // If goes deeper than the iteration depth, get out
+                    if (property.depth != depth)
+                    {
+                        break;
+                    }
+
+                    if (isSubEditor && property.name.Equals("m_Script"))
+                    {
+                        continue;
+                    }
+
+                    if (filter != null)
+                    {
+                        var filterResult = filter();
+
+                        if (filterResult == IterControl.Break)
+                        {
+                            break;
+                        }
+
+                        if (filterResult == IterControl.Continue)
+                        {
+                            continue;
+                        }
+                    }
+
+                    DrawPropertySortableArray(property);
+                } while (property.NextVisible(false));
+            }
+        }
+
+
+        /// <summary>
+        ///     Draw a SerializedProperty as a ReorderableList if it was found during
+        ///     initialization, otherwise use EditorGUILayout.PropertyField
+        /// </summary>
+        /// <param name="property"></param>
+        protected void DrawPropertySortableArray(SerializedProperty property)
+        {
+            // Try to get the sortable list this property belongs to
+            SortableListData listData = null;
+
+            if (listIndex.Count > 0)
+            {
+                listData = listIndex.Find(data => property.propertyPath.StartsWith(data.Parent));
+            }
+
+            Editor scriptableEditor;
+            var isScriptableEditor = editableIndex.TryGetValue(property.propertyPath, out scriptableEditor);
+
+            // Has ReorderableList
+            if (listData != null)
+            {
+                // Try to show the list
+                if (listData.DoLayoutProperty(property) == false)
+                {
+                    EditorGUILayout.PropertyField(property, false);
+
+                    if (property.isExpanded)
+                    {
+                        EditorGUI.indentLevel++;
+                        var targetProp = serializedObject.FindProperty(property.propertyPath);
+                        IterateDrawProperty(targetProp);
+                        EditorGUI.indentLevel--;
+                    }
+                }
+            }
+            // Else try to draw ScriptableObject editor
+            else if (isScriptableEditor)
+            {
+                var hasHeader = property.HasAttribute<HeaderAttribute>();
+                var hasSpace = property.HasAttribute<SpaceAttribute>();
+
+                float foldoutSpace = hasHeader ? 24 : 7;
+
+                if (hasHeader && hasSpace)
+                {
+                    foldoutSpace = 31;
+                }
+
+                hasSpace |= hasHeader;
+
+                // No data in property, draw property field with create button
+                if (scriptableEditor == null)
+                {
+                    bool doCreate;
+
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        EditorGUILayout.PropertyField(property, uiExpandWidth);
+
+                        using (new EditorGUILayout.VerticalScope(uiWidth50))
+                        {
+                            if (hasSpace)
+                            {
+                                GUILayout.Space(10);
+                            }
+
+                            doCreate = GUILayout.Button(labelBtnCreate, EditorStyles.miniButton);
+                        }
+                    }
+
+                    if (doCreate)
+                    {
+                        var propType = property.GetTypeReflection();
+                        var createdAsset = CreateAssetWithSavePrompt(propType, "Assets");
+
+                        if (createdAsset != null)
+                        {
+                            property.objectReferenceValue = createdAsset;
+                            property.isExpanded = true;
+                        }
+                    }
+                }
+                // Has data in property, draw foldout and editor
+                else
+                {
+                    EditorGUILayout.PropertyField(property);
+
+                    var rectFoldout = GUILayoutUtility.GetLastRect();
+                    rectFoldout.width = 20;
+
+                    if (hasSpace)
+                    {
+                        rectFoldout.yMin += foldoutSpace;
+                    }
+
+                    property.isExpanded = EditorGUI.Foldout(rectFoldout, property.isExpanded, GUIContent.none);
+
+                    if (property.isExpanded)
+                    {
+                        EditorGUI.indentLevel++;
+
+                        using (new EditorGUILayout.VerticalScope(styleEditBox))
+                        {
+                            var restoreIndent = EditorGUI.indentLevel;
+                            EditorGUI.indentLevel = 1;
+                            scriptableEditor.serializedObject.Update();
+                            scriptableEditor.OnInspectorGUI();
+                            scriptableEditor.serializedObject.ApplyModifiedProperties();
+                            EditorGUI.indentLevel = restoreIndent;
+                        }
+
+                        EditorGUI.indentLevel--;
+                    }
+                }
+            }
+            else
+            {
+                var targetProp = serializedObject.FindProperty(property.propertyPath);
+
+                var isStartProp = targetProp.propertyPath.StartsWith("m_");
+
+                using (new EditorGUI.DisabledScope(isStartProp))
+                {
+                    EditorGUILayout.PropertyField(targetProp, targetProp.isExpanded);
+                }
+            }
+        }
+
+
+        // Creates a new ScriptableObject via the default Save File panel
+        private ScriptableObject CreateAssetWithSavePrompt(Type type, string path)
+        {
+            path = EditorUtility.SaveFilePanelInProject("Save ScriptableObject", "New " + type.Name + ".asset", "asset", "Enter a file name for the ScriptableObject.", path);
+
+            if (path == "")
+            {
+                return null;
+            }
+
+            var asset = CreateInstance(type);
+            AssetDatabase.CreateAsset(asset, path);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            AssetDatabase.ImportAsset(path, ImportAssetOptions.ForceUpdate);
+            EditorGUIUtility.PingObject(asset);
+
+            return asset;
+        }
+
+
+        /// <summary>
+        ///     Internal class that manages ReorderableLists for each reorderable
+        ///     SerializedProperty in a SerializedObject's direct child
+        /// </summary>
+        protected class SortableListData
+        {
+            public Func<int, string> ElementHeaderCallback = null;
+
+            private readonly Dictionary<string, ReorderableList> propIndex = new();
+            private readonly Dictionary<string, Action<SerializedProperty, Object[]>> propDropHandlers = new();
+            private readonly Dictionary<string, int> countIndex = new();
+
+
+            public SortableListData(string parent)
+            {
+                Parent = parent;
+            }
+
+
+            public string Parent { get; }
+
+
+            public void AddProperty(SerializedProperty property)
+            {
+                // Check if this property actually belongs to the same direct child
+                if (GetGrandParentPath(property).Equals(Parent) == false)
+                {
+                    return;
+                }
+
+                var propList = new ReorderableList(
+                    property.serializedObject, property,
+                    true, false,
+                    true, true)
+                {
+                    headerHeight = 5
+                };
+
+                propList.drawElementCallback = delegate(Rect rect, int index, bool active, bool focused)
+                {
+                    var targetElement = property.GetArrayElementAtIndex(index);
+
+                    var isExpanded = targetElement.isExpanded;
+                    rect.height = EditorGUI.GetPropertyHeight(targetElement, GUIContent.none, isExpanded);
+
+                    if (targetElement.hasVisibleChildren)
+                    {
+                        rect.xMin += 10;
+                    }
+
+                    // Get Unity to handle drawing each element
+                    var propHeader = new GUIContent(targetElement.displayName);
+
+                    if (ElementHeaderCallback != null)
+                    {
+                        propHeader.text = ElementHeaderCallback(index);
+                    }
+
+                    EditorGUI.PropertyField(rect, targetElement, propHeader, isExpanded);
+
+                    // If drawing the selected element, use it to set the element height
+                    // Element height seems to control selected background
+                    #if UNITY_5_1 || UNITY_5_2
 					if (index == propList.index)
 					{	
 						// Height might have changed when dealing with serialized class
@@ -126,767 +428,713 @@ namespace SubjectNerd.Utilities
 						if (rect.height != newHeight)
 							propList.elementHeight = Mathf.Max(propList.elementHeight, newHeight);
 					}
-#endif
-				};
+                    #endif
+                };
 
-				// Unity 5.3 onwards allows reorderable lists to have variable element heights
-#if UNITY_5_3_OR_NEWER
-				propList.elementHeightCallback = index => ElementHeightCallback(property, index);
+                // Unity 5.3 onwards allows reorderable lists to have variable element heights
+                #if UNITY_5_3_OR_NEWER
+                propList.elementHeightCallback = index => ElementHeightCallback(property, index);
 
-				propList.drawElementBackgroundCallback = (rect, index, active, focused) =>
-				{
-					if (styleHighlight == null)
-						styleHighlight = GUI.skin.FindStyle("MeTransitionSelectHead");
-					if (focused == false)
-						return;
-					rect.height = ElementHeightCallback(property, index);
-					GUI.Box(rect, GUIContent.none, styleHighlight);
-				};
-#endif
-				propIndex.Add(property.propertyPath, propList);
-			}
+                propList.drawElementBackgroundCallback = (rect, index, active, focused) =>
+                {
+                    if (styleHighlight == null)
+                    {
+                        styleHighlight = GUI.skin.FindStyle("MeTransitionSelectHead");
+                    }
 
-			private float ElementHeightCallback(SerializedProperty property, int index)
-			{
-				SerializedProperty arrayElement = property.GetArrayElementAtIndex(index);
-				float calculatedHeight = EditorGUI.GetPropertyHeight(arrayElement,
-																	GUIContent.none,
-																	arrayElement.isExpanded);
-				calculatedHeight += 3;
-				return calculatedHeight;
-			}
+                    if (focused == false)
+                    {
+                        return;
+                    }
 
-			public bool DoLayoutProperty(SerializedProperty property)
-			{
-				if (propIndex.ContainsKey(property.propertyPath) == false)
-					return false;
+                    rect.height = ElementHeightCallback(property, index);
+                    GUI.Box(rect, GUIContent.none, styleHighlight);
+                };
+                #endif
+                propIndex.Add(property.propertyPath, propList);
+            }
 
-				// Draw the header
-				string headerText = string.Format("{0} [{1}]", property.displayName, property.arraySize);
-				EditorGUILayout.PropertyField(property, new GUIContent(headerText), false);
 
-				// Save header rect for handling drag and drop
-				Rect dropRect = GUILayoutUtility.GetLastRect();
+            private float ElementHeightCallback(SerializedProperty property, int index)
+            {
+                var arrayElement = property.GetArrayElementAtIndex(index);
 
-				// Draw the reorderable list for the property
-				if (property.isExpanded)
-				{
-					int newArraySize = EditorGUILayout.IntField("Size", property.arraySize);
-					if (newArraySize != property.arraySize)
-						property.arraySize = newArraySize;
-					propIndex[property.propertyPath].DoLayoutList();
-				}
+                var calculatedHeight = EditorGUI.GetPropertyHeight(arrayElement,
+                    GUIContent.none,
+                    arrayElement.isExpanded);
 
-				// Handle drag and drop into the header
-				Event evt = Event.current;
-				if (evt == null)
-					return true;
+                calculatedHeight += 3;
 
-#if UNITY_2018_2_OR_NEWER
+                return calculatedHeight;
+            }
+
+
+            public bool DoLayoutProperty(SerializedProperty property)
+            {
+                if (propIndex.ContainsKey(property.propertyPath) == false)
+                {
+                    return false;
+                }
+
+                // Draw the header
+                var headerText = string.Format("{0} [{1}]", property.displayName, property.arraySize);
+                EditorGUILayout.PropertyField(property, new GUIContent(headerText), false);
+
+                // Save header rect for handling drag and drop
+                var dropRect = GUILayoutUtility.GetLastRect();
+
+                // Draw the reorderable list for the property
+                if (property.isExpanded)
+                {
+                    var newArraySize = EditorGUILayout.IntField("Size", property.arraySize);
+
+                    if (newArraySize != property.arraySize)
+                    {
+                        property.arraySize = newArraySize;
+                    }
+
+                    propIndex[property.propertyPath].DoLayoutList();
+                }
+
+                // Handle drag and drop into the header
+                var evt = Event.current;
+
+                if (evt == null)
+                {
+                    return true;
+                }
+
+                #if UNITY_2018_2_OR_NEWER
                 if (evt.type == EventType.DragUpdated || evt.type == EventType.DragPerform)
-#else
+                    #else
                 if (evt.type == EventType.dragUpdated || evt.type == EventType.dragPerform)
-#endif
+                    #endif
                 {
                     if (dropRect.Contains(evt.mousePosition) == false)
-						return true;
+                    {
+                        return true;
+                    }
 
-					DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
-					if (evt.type == EventType.DragPerform)
-					{
-						DragAndDrop.AcceptDrag();
-						Action<SerializedProperty, Object[]> handler = null;
-						if (propDropHandlers.TryGetValue(property.propertyPath, out handler))
-						{
-							if (handler != null)
-								handler(property, DragAndDrop.objectReferences);
-						}
-						else
-						{
-							foreach (Object dragged_object in DragAndDrop.objectReferences)
-							{
-								if (dragged_object.GetType() != property.GetType())
-									continue;
+                    DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
 
-								int newIndex = property.arraySize;
-								property.arraySize++;
+                    if (evt.type == EventType.DragPerform)
+                    {
+                        DragAndDrop.AcceptDrag();
+                        Action<SerializedProperty, Object[]> handler = null;
 
-								SerializedProperty target = property.GetArrayElementAtIndex(newIndex);
-								target.objectReferenceInstanceIDValue = dragged_object.GetInstanceID();
-							}
-						}
-						evt.Use();
-					}
-				}
-				return true;
-			}
+                        if (propDropHandlers.TryGetValue(property.propertyPath, out handler))
+                        {
+                            if (handler != null)
+                            {
+                                handler(property, DragAndDrop.objectReferences);
+                            }
+                        }
+                        else
+                        {
+                            foreach (var dragged_object in DragAndDrop.objectReferences)
+                            {
+                                if (dragged_object.GetType() != property.GetType())
+                                {
+                                    continue;
+                                }
 
-			public int GetElementCount(SerializedProperty property)
-			{
-				if (property.arraySize <= 0)
-					return 0;
+                                var newIndex = property.arraySize;
+                                property.arraySize++;
 
-				int count;
-				if (countIndex.TryGetValue(property.propertyPath, out count))
-					return count;
+                                var target = property.GetArrayElementAtIndex(newIndex);
+                                target.objectReferenceInstanceIDValue = dragged_object.GetInstanceID();
+                            }
+                        }
 
-				var element = property.GetArrayElementAtIndex(0);
-				var countElement = element.Copy();
-				int childCount = 0;
-				if (countElement.NextVisible(true))
-				{
-					int depth = countElement.Copy().depth;
-					do
-					{
-						if (countElement.depth != depth)
-							break;
-						childCount++;
-					} while (countElement.NextVisible(false));
-				}
+                        evt.Use();
+                    }
+                }
 
-				countIndex.Add(property.propertyPath, childCount);
-				return childCount;
-			}
+                return true;
+            }
 
-			public ReorderableList GetPropertyList(SerializedProperty property)
-			{
-				if (propIndex.ContainsKey(property.propertyPath))
-					return propIndex[property.propertyPath];
-				return null;
-			}
 
-			public void SetDropHandler(SerializedProperty property, Action<SerializedProperty, Object[]> handler)
-			{
-				string path = property.propertyPath;
-				if (propDropHandlers.ContainsKey(path))
-					propDropHandlers[path] = handler;
-				else
-					propDropHandlers.Add(path, handler);
-			}
-		} // End SortableListData
+            public int GetElementCount(SerializedProperty property)
+            {
+                if (property.arraySize <= 0)
+                {
+                    return 0;
+                }
 
-		public bool isSubEditor;
+                int count;
 
-		private readonly GUILayoutOption uiExpandWidth = GUILayout.ExpandWidth(true);
-		private readonly GUILayoutOption uiWidth50 = GUILayout.Width(50);
-		private readonly GUIContent labelBtnCreate = new GUIContent("Create");
-		private GUIStyle styleEditBox;
+                if (countIndex.TryGetValue(property.propertyPath, out count))
+                {
+                    return count;
+                }
 
-		private readonly List<SortableListData> listIndex = new List<SortableListData>();
-		private readonly Dictionary<string, Editor> editableIndex = new Dictionary<string, Editor>();
+                var element = property.GetArrayElementAtIndex(0);
+                var countElement = element.Copy();
+                var childCount = 0;
 
-		protected bool alwaysDrawInspector = false;
-		protected bool isInitialized = false;
-		protected bool hasSortableArrays = false;
-		protected bool hasEditable = false;
+                if (countElement.NextVisible(true))
+                {
+                    var depth = countElement.Copy().depth;
 
-		protected struct ContextMenuData
-		{
-			public string menuItem;
-			public MethodInfo function;
-			public MethodInfo validate;
+                    do
+                    {
+                        if (countElement.depth != depth)
+                        {
+                            break;
+                        }
 
-			public ContextMenuData(string item)
-			{
-				menuItem = item;
-				function = null;
-				validate = null;
-			}
-		}
+                        childCount++;
+                    } while (countElement.NextVisible(false));
+                }
 
-		protected Dictionary<string, ContextMenuData> contextData = new Dictionary<string, ContextMenuData>();
+                countIndex.Add(property.propertyPath, childCount);
 
-		~ReorderableArrayInspector()
-		{
-			listIndex.Clear();
-			//hasSortableArrays = false;
-			editableIndex.Clear();
-			//hasEditable = false;
-			isInitialized = false;
-		}
+                return childCount;
+            }
 
-#region Initialization
-		private void OnEnable()
-		{
-			InitInspector();
-		}
 
-		protected virtual void InitInspector(bool force)
-		{
-			if (force)
-				isInitialized = false;
-			InitInspector();
-		}
+            public ReorderableList GetPropertyList(SerializedProperty property)
+            {
+                if (propIndex.ContainsKey(property.propertyPath))
+                {
+                    return propIndex[property.propertyPath];
+                }
 
-		protected virtual void InitInspector()
-		{
-			if (isInitialized && FORCE_INIT == false)
-				return;
+                return null;
+            }
 
-			styleEditBox = new GUIStyle(EditorStyles.helpBox) { padding = new RectOffset(5, 5, 5, 5) };
-			FindTargetProperties();
-			FindContextMenu();
-		}
 
-		protected void FindTargetProperties()
-		{
-			listIndex.Clear();
-			editableIndex.Clear();
-			Type typeScriptable = typeof(ScriptableObject);
+            public void SetDropHandler(SerializedProperty property, Action<SerializedProperty, Object[]> handler)
+            {
+                var path = property.propertyPath;
 
-			SerializedProperty iterProp = serializedObject.GetIterator();
-			// This iterator goes through all the child serialized properties, looking
-			// for properties that have the SortableArray attribute
-			if (iterProp.NextVisible(true))
-			{
-				do
-				{
-					if (iterProp.isArray && iterProp.propertyType != SerializedPropertyType.String)
-					{
-#if LIST_ALL_ARRAYS
+                if (propDropHandlers.ContainsKey(path))
+                {
+                    propDropHandlers[path] = handler;
+                }
+                else
+                {
+                    propDropHandlers.Add(path, handler);
+                }
+            }
+        } // End SortableListData
+
+
+        protected struct ContextMenuData
+        {
+            public string menuItem;
+            public MethodInfo function;
+            public MethodInfo validate;
+
+
+            public ContextMenuData(string item)
+            {
+                menuItem = item;
+                function = null;
+                validate = null;
+            }
+        }
+
+
+        protected enum IterControl
+        {
+            Draw,
+            Continue,
+            Break
+        }
+
+
+        #region Initialization
+
+        private void OnEnable()
+        {
+            InitInspector();
+        }
+
+
+        protected virtual void InitInspector(bool force)
+        {
+            if (force)
+            {
+                isInitialized = false;
+            }
+
+            InitInspector();
+        }
+
+
+        protected virtual void InitInspector()
+        {
+            if (isInitialized && FORCE_INIT == false)
+            {
+                return;
+            }
+
+            styleEditBox = new GUIStyle(EditorStyles.helpBox) {padding = new RectOffset(5, 5, 5, 5)};
+            FindTargetProperties();
+            FindContextMenu();
+        }
+
+
+        protected void FindTargetProperties()
+        {
+            listIndex.Clear();
+            editableIndex.Clear();
+            var typeScriptable = typeof(ScriptableObject);
+
+            var iterProp = serializedObject.GetIterator();
+
+            // This iterator goes through all the child serialized properties, looking
+            // for properties that have the SortableArray attribute
+            if (iterProp.NextVisible(true))
+            {
+                do
+                {
+                    if (iterProp.isArray && iterProp.propertyType != SerializedPropertyType.String)
+                    {
+                        #if LIST_ALL_ARRAYS
 						bool canTurnToList = true;
-#else
-						bool canTurnToList = iterProp.HasAttribute<ReorderableAttribute>();
-#endif
-						if (canTurnToList)
-						{
-							hasSortableArrays = true;
-							CreateListData(serializedObject.FindProperty(iterProp.propertyPath));
-						}
-					}
+                        #else
+                        var canTurnToList = iterProp.HasAttribute<ReorderableAttribute>();
+                        #endif
+                        if (canTurnToList)
+                        {
+                            hasSortableArrays = true;
+                            CreateListData(serializedObject.FindProperty(iterProp.propertyPath));
+                        }
+                    }
 
-					if (iterProp.propertyType == SerializedPropertyType.ObjectReference)
-					{
-						Type propType = iterProp.GetTypeReflection();
-						if (propType == null)
-							continue;
+                    if (iterProp.propertyType == SerializedPropertyType.ObjectReference)
+                    {
+                        var propType = iterProp.GetTypeReflection();
 
-						bool isScriptable = propType.IsSubclassOf(typeScriptable);
-						if (isScriptable)
-						{
-#if EDIT_ALL_SCRIPTABLES
+                        if (propType == null)
+                        {
+                            continue;
+                        }
+
+                        var isScriptable = propType.IsSubclassOf(typeScriptable);
+
+                        if (isScriptable)
+                        {
+                            #if EDIT_ALL_SCRIPTABLES
 							bool makeEditable = true;
-#else
-							bool makeEditable = iterProp.HasAttribute<EditScriptableAttribute>();
-#endif
+                            #else
+                            var makeEditable = iterProp.HasAttribute<EditScriptableAttribute>();
+                            #endif
 
-							if (makeEditable)
-							{
-								Editor scriptableEditor = null;
-								if (iterProp.objectReferenceValue != null)
-								{
-#if UNITY_5_6_OR_NEWER
-									CreateCachedEditorWithContext(iterProp.objectReferenceValue,
-																serializedObject.targetObject, null,
-																ref scriptableEditor);
-#else
+                            if (makeEditable)
+                            {
+                                Editor scriptableEditor = null;
+
+                                if (iterProp.objectReferenceValue != null)
+                                {
+                                    #if UNITY_5_6_OR_NEWER
+                                    CreateCachedEditorWithContext(iterProp.objectReferenceValue,
+                                        serializedObject.targetObject, null,
+                                        ref scriptableEditor);
+                                    #else
 									CreateCachedEditor(iterProp.objectReferenceValue, null, ref scriptableEditor);
-#endif
-									var reorderable = scriptableEditor as ReorderableArrayInspector;
-									if (reorderable != null)
-										reorderable.isSubEditor = true;
-								}
-								editableIndex.Add(iterProp.propertyPath, scriptableEditor);
-								hasEditable = true;
-							}
-						}
-					}
-				} while (iterProp.NextVisible(true));
-			}
+                                    #endif
+                                    var reorderable = scriptableEditor as ReorderableArrayInspector;
 
-			isInitialized = true;
-			if (hasSortableArrays == false)
-			{
-				listIndex.Clear();
-			}
-		}
+                                    if (reorderable != null)
+                                    {
+                                        reorderable.isSubEditor = true;
+                                    }
+                                }
 
-		private IEnumerable<MethodInfo> GetAllMethods(Type t)
-		{
-			if (t == null)
-				return Enumerable.Empty<MethodInfo>();
-			var binding = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-			return t.GetMethods(binding).Concat(GetAllMethods(t.BaseType));
-		}
+                                editableIndex.Add(iterProp.propertyPath, scriptableEditor);
+                                hasEditable = true;
+                            }
+                        }
+                    }
+                } while (iterProp.NextVisible(true));
+            }
 
-		private void FindContextMenu()
-		{
-			contextData.Clear();
+            isInitialized = true;
 
-			// Get context menu
-			Type targetType = target.GetType();
-			Type contextMenuType = typeof(ContextMenu);
-			MethodInfo[] methods = GetAllMethods(targetType).ToArray();
-			for (int index = 0; index < methods.GetLength(0); ++index)
-			{
-				MethodInfo methodInfo = methods[index];
-				foreach (ContextMenu contextMenu in methodInfo.GetCustomAttributes(contextMenuType, false))
-				{
-					if (contextData.ContainsKey(contextMenu.menuItem))
-					{
-						var data = contextData[contextMenu.menuItem];
-						if (contextMenu.validate)
-							data.validate = methodInfo;
-						else
-							data.function = methodInfo;
-						contextData[data.menuItem] = data;
-					}
-					else
-					{
-						var data = new ContextMenuData(contextMenu.menuItem);
-						if (contextMenu.validate)
-							data.validate = methodInfo;
-						else
-							data.function = methodInfo;
-						contextData.Add(data.menuItem, data);
-					}
-				}
-			}
-		}
+            if (hasSortableArrays == false)
+            {
+                listIndex.Clear();
+            }
+        }
 
-		private void CreateListData(SerializedProperty property)
-		{
-			string parent = GetGrandParentPath(property);
 
-			// Try to find the grand parent in SortableListData
-			SortableListData data = listIndex.Find(listData => listData.Parent.Equals(parent));
-			if (data == null)
-			{
-				data = new SortableListData(parent);
-				listIndex.Add(data);
-			}
+        private IEnumerable<MethodInfo> GetAllMethods(Type t)
+        {
+            if (t == null)
+            {
+                return Enumerable.Empty<MethodInfo>();
+            }
 
-			data.AddProperty(property);
-			object[] attr = property.GetAttributes<ReorderableAttribute>();
-			if (attr != null && attr.Length == 1)
-			{
-				ReorderableAttribute arrayAttr = (ReorderableAttribute)attr[0];
-				if (arrayAttr != null)
-				{
-					HandleReorderableOptions(arrayAttr, property, data);
-				}
-			}
-		}
+            var binding = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
-		private void HandleReorderableOptions(ReorderableAttribute arrayAttr, SerializedProperty property, SortableListData data)
-		{
-			// Custom element header
-			if (string.IsNullOrEmpty(arrayAttr.ElementHeader) == false)
-			{
-				data.ElementHeaderCallback = i => string.Format("{0} {1}", arrayAttr.ElementHeader, (arrayAttr.HeaderZeroIndex ? i : i + 1));
-			}
+            return t.GetMethods(binding).Concat(GetAllMethods(t.BaseType));
+        }
 
-			// Draw property as single line
-			if (arrayAttr.ElementSingleLine)
-			{
-				var list = data.GetPropertyList(property);
-#if UNITY_5_3_OR_NEWER
-				list.elementHeightCallback = index => EditorGUIUtility.singleLineHeight + 6;
-				list.drawElementBackgroundCallback = (rect, index, active, focused) =>
-				{
-					if (focused == false)
-						return;
-					if (styleHighlight == null)
-						styleHighlight = GUI.skin.FindStyle("MeTransitionSelectHead");
-					GUI.Box(rect, GUIContent.none, styleHighlight);
-				};
-#endif
 
-				list.drawElementCallback = (rect, index, active, focused) =>
-				{
-					var element = property.GetArrayElementAtIndex(index);
-					element.isExpanded = false;
+        private void FindContextMenu()
+        {
+            contextData.Clear();
 
-					int childCount = data.GetElementCount(property);
-					if (childCount < 1)
-						return;
+            // Get context menu
+            var targetType = target.GetType();
+            var contextMenuType = typeof(ContextMenu);
+            var methods = GetAllMethods(targetType).ToArray();
 
-					rect.y += 3;
-					rect.height -= 6;
+            for (var index = 0; index < methods.GetLength(0); ++index)
+            {
+                var methodInfo = methods[index];
 
-					if (element.NextVisible(true))
-					{
-						float restoreWidth = EditorGUIUtility.labelWidth;
-						EditorGUIUtility.labelWidth /= childCount;
+                foreach (ContextMenu contextMenu in methodInfo.GetCustomAttributes(contextMenuType, false))
+                {
+                    if (contextData.ContainsKey(contextMenu.menuItem))
+                    {
+                        var data = contextData[contextMenu.menuItem];
 
-						float padding = 5f;
-						float width = rect.width - padding * (childCount - 1);
-						width /= childCount;
+                        if (contextMenu.validate)
+                        {
+                            data.validate = methodInfo;
+                        }
+                        else
+                        {
+                            data.function = methodInfo;
+                        }
 
-						Rect childRect = new Rect(rect) { width = width };
-						int depth = element.Copy().depth;
-						do
-						{
-							if (element.depth != depth)
-								break;
+                        contextData[data.menuItem] = data;
+                    }
+                    else
+                    {
+                        var data = new ContextMenuData(contextMenu.menuItem);
 
-							if (childCount <= 2)
-								EditorGUI.PropertyField(childRect, element, false);
-							else
-								EditorGUI.PropertyField(childRect, element, GUIContent.none, false);
-							childRect.x += width + padding;
-						} while (element.NextVisible(false));
+                        if (contextMenu.validate)
+                        {
+                            data.validate = methodInfo;
+                        }
+                        else
+                        {
+                            data.function = methodInfo;
+                        }
 
-						EditorGUIUtility.labelWidth = restoreWidth;
-					}
-				};
-			}
-		}
+                        contextData.Add(data.menuItem, data);
+                    }
+                }
+            }
+        }
 
-		/// <summary>
-		/// Given a SerializedProperty, return the automatic ReorderableList assigned to it if any
-		/// </summary>
-		/// <param name="property"></param>
-		/// <returns></returns>
-		protected ReorderableList GetSortableList(SerializedProperty property)
-		{
-			if (listIndex.Count == 0)
-				return null;
 
-			string parent = GetGrandParentPath(property);
+        private void CreateListData(SerializedProperty property)
+        {
+            var parent = GetGrandParentPath(property);
 
-			SortableListData data = listIndex.Find(listData => listData.Parent.Equals(parent));
-			if (data == null)
-				return null;
+            // Try to find the grand parent in SortableListData
+            var data = listIndex.Find(listData => listData.Parent.Equals(parent));
 
-			return data.GetPropertyList(property);
-		}
+            if (data == null)
+            {
+                data = new SortableListData(parent);
+                listIndex.Add(data);
+            }
 
-		/// <summary>
-		/// Set a drag and drop handler function on a SerializedObject's ReorderableList, if any
-		/// </summary>
-		/// <param name="property"></param>
-		/// <param name="handler"></param>
-		/// <returns></returns>
-		protected bool SetDragDropHandler(SerializedProperty property, Action<SerializedProperty, Object[]> handler)
-		{
-			if (listIndex.Count == 0)
-				return false;
+            data.AddProperty(property);
+            var attr = property.GetAttributes<ReorderableAttribute>();
 
-			string parent = GetGrandParentPath(property);
+            if (attr != null && attr.Length == 1)
+            {
+                var arrayAttr = (ReorderableAttribute) attr[0];
 
-			SortableListData data = listIndex.Find(listData => listData.Parent.Equals(parent));
-			if (data == null)
-				return false;
+                if (arrayAttr != null)
+                {
+                    HandleReorderableOptions(arrayAttr, property, data);
+                }
+            }
+        }
 
-			data.SetDropHandler(property, handler);
-			return true;
-		}
-#endregion
 
-		protected bool InspectorGUIStart(bool force = false)
-		{
-			// Not initialized, try initializing
-			if (hasSortableArrays && listIndex.Count == 0)
-				InitInspector();
-			if (hasEditable && editableIndex.Count == 0)
-				InitInspector();
+        private void HandleReorderableOptions(ReorderableAttribute arrayAttr, SerializedProperty property, SortableListData data)
+        {
+            // Custom element header
+            if (string.IsNullOrEmpty(arrayAttr.ElementHeader) == false)
+            {
+                data.ElementHeaderCallback = i => string.Format("{0} {1}", arrayAttr.ElementHeader, arrayAttr.HeaderZeroIndex ? i : i + 1);
+            }
 
-			// No sortable arrays or list index unintialized
-			bool cannotDrawOrderable = (hasSortableArrays == false || listIndex.Count == 0);
-			bool cannotDrawEditable = (hasEditable == false || editableIndex.Count == 0);
-			if (cannotDrawOrderable && cannotDrawEditable && force == false)
-			{
-				if (isSubEditor)
-					DrawPropertiesExcluding(serializedObject, "m_Script");
-				else
-					base.OnInspectorGUI();
+            // Draw property as single line
+            if (arrayAttr.ElementSingleLine)
+            {
+                var list = data.GetPropertyList(property);
+                #if UNITY_5_3_OR_NEWER
+                list.elementHeightCallback = index => EditorGUIUtility.singleLineHeight + 6;
 
-				DrawContextMenuButtons();
-				return false;
-			}
+                list.drawElementBackgroundCallback = (rect, index, active, focused) =>
+                {
+                    if (focused == false)
+                    {
+                        return;
+                    }
 
-			serializedObject.Update();
-			return true;
-		}
+                    if (styleHighlight == null)
+                    {
+                        styleHighlight = GUI.skin.FindStyle("MeTransitionSelectHead");
+                    }
 
-		protected virtual void DrawInspector()
-		{
-			DrawPropertiesAll();
-		}
+                    GUI.Box(rect, GUIContent.none, styleHighlight);
+                };
+                #endif
 
-		public override void OnInspectorGUI()
-		{
-			if (InspectorGUIStart(alwaysDrawInspector) == false)
-				return;
+                list.drawElementCallback = (rect, index, active, focused) =>
+                {
+                    var element = property.GetArrayElementAtIndex(index);
+                    element.isExpanded = false;
 
-			EditorGUI.BeginChangeCheck();
+                    var childCount = data.GetElementCount(property);
 
-			DrawInspector();
+                    if (childCount < 1)
+                    {
+                        return;
+                    }
 
-			if (EditorGUI.EndChangeCheck())
-			{
-				serializedObject.ApplyModifiedProperties();
-				InitInspector(true);
-			}
+                    rect.y += 3;
+                    rect.height -= 6;
 
-			DrawContextMenuButtons();
-		}
+                    if (element.NextVisible(true))
+                    {
+                        var restoreWidth = EditorGUIUtility.labelWidth;
+                        EditorGUIUtility.labelWidth /= childCount;
 
-		protected enum IterControl
-		{
-			Draw,
-			Continue,
-			Break
-		}
+                        var padding = 5f;
+                        var width = rect.width - padding * (childCount - 1);
+                        width /= childCount;
 
-		protected void IterateDrawProperty(SerializedProperty property, Func<IterControl> filter = null)
-		{
-			if (property.NextVisible(true))
-			{
-				// Remember depth iteration started from
-				int depth = property.Copy().depth;
-				do
-				{
-					// If goes deeper than the iteration depth, get out
-					if (property.depth != depth)
-						break;
-					if (isSubEditor && property.name.Equals("m_Script"))
-						continue;
+                        var childRect = new Rect(rect) {width = width};
+                        var depth = element.Copy().depth;
 
-					if (filter != null)
-					{
-						var filterResult = filter();
-						if (filterResult == IterControl.Break)
-							break;
-						if (filterResult == IterControl.Continue)
-							continue;
-					}
+                        do
+                        {
+                            if (element.depth != depth)
+                            {
+                                break;
+                            }
 
-					DrawPropertySortableArray(property);
-				} while (property.NextVisible(false));
-			}
-		}
+                            if (childCount <= 2)
+                            {
+                                EditorGUI.PropertyField(childRect, element, false);
+                            }
+                            else
+                            {
+                                EditorGUI.PropertyField(childRect, element, GUIContent.none, false);
+                            }
 
-		/// <summary>
-		/// Draw a SerializedProperty as a ReorderableList if it was found during
-		/// initialization, otherwise use EditorGUILayout.PropertyField
-		/// </summary>
-		/// <param name="property"></param>
-		protected void DrawPropertySortableArray(SerializedProperty property)
-		{
-			// Try to get the sortable list this property belongs to
-			SortableListData listData = null;
-			if (listIndex.Count > 0)
-				listData = listIndex.Find(data => property.propertyPath.StartsWith(data.Parent));
+                            childRect.x += width + padding;
+                        } while (element.NextVisible(false));
 
-			Editor scriptableEditor;
-			bool isScriptableEditor = editableIndex.TryGetValue(property.propertyPath, out scriptableEditor);
+                        EditorGUIUtility.labelWidth = restoreWidth;
+                    }
+                };
+            }
+        }
 
-			// Has ReorderableList
-			if (listData != null)
-			{
-				// Try to show the list
-				if (listData.DoLayoutProperty(property) == false)
-				{
-					EditorGUILayout.PropertyField(property, false);
-					if (property.isExpanded)
-					{
-						EditorGUI.indentLevel++;
-						SerializedProperty targetProp = serializedObject.FindProperty(property.propertyPath);
-						IterateDrawProperty(targetProp);
-						EditorGUI.indentLevel--;
-					}
-				}
-			}
-			// Else try to draw ScriptableObject editor
-			else if (isScriptableEditor)
-			{
-				bool hasHeader = property.HasAttribute<HeaderAttribute>();
-				bool hasSpace = property.HasAttribute<SpaceAttribute>();
 
-				float foldoutSpace = hasHeader ? 24 : 7;
-				if (hasHeader && hasSpace)
-					foldoutSpace = 31;
+        /// <summary>
+        ///     Given a SerializedProperty, return the automatic ReorderableList assigned to it if any
+        /// </summary>
+        /// <param name="property"></param>
+        /// <returns></returns>
+        protected ReorderableList GetSortableList(SerializedProperty property)
+        {
+            if (listIndex.Count == 0)
+            {
+                return null;
+            }
 
-				hasSpace |= hasHeader;
+            var parent = GetGrandParentPath(property);
 
-				// No data in property, draw property field with create button
-				if (scriptableEditor == null)
-				{
-					bool doCreate;
-					using (new EditorGUILayout.HorizontalScope())
-					{
-						EditorGUILayout.PropertyField(property, uiExpandWidth);
-						using (new EditorGUILayout.VerticalScope(uiWidth50))
-						{
-							if (hasSpace) GUILayout.Space(10);
-							doCreate = GUILayout.Button(labelBtnCreate, EditorStyles.miniButton);
-						}
-					}
+            var data = listIndex.Find(listData => listData.Parent.Equals(parent));
 
-					if (doCreate)
-					{
-						Type propType = property.GetTypeReflection();
-						var createdAsset = CreateAssetWithSavePrompt(propType, "Assets");
-						if (createdAsset != null)
-						{
-							property.objectReferenceValue = createdAsset;
-							property.isExpanded = true;
-						}
-					}
-				}
-				// Has data in property, draw foldout and editor
-				else
-				{
-					EditorGUILayout.PropertyField(property);
+            if (data == null)
+            {
+                return null;
+            }
 
-					Rect rectFoldout = GUILayoutUtility.GetLastRect();
-					rectFoldout.width = 20;
-					if (hasSpace) rectFoldout.yMin += foldoutSpace;
+            return data.GetPropertyList(property);
+        }
 
-					property.isExpanded = EditorGUI.Foldout(rectFoldout, property.isExpanded, GUIContent.none);
 
-					if (property.isExpanded)
-					{
-						EditorGUI.indentLevel++;
-						using (new EditorGUILayout.VerticalScope(styleEditBox))
-						{
-							var restoreIndent = EditorGUI.indentLevel;
-							EditorGUI.indentLevel = 1;
-							scriptableEditor.serializedObject.Update();
-							scriptableEditor.OnInspectorGUI();
-							scriptableEditor.serializedObject.ApplyModifiedProperties();
-							EditorGUI.indentLevel = restoreIndent;
-						}
-						EditorGUI.indentLevel--;
-					}
-				}
-			}
-			else
-			{
-				SerializedProperty targetProp = serializedObject.FindProperty(property.propertyPath);
+        /// <summary>
+        ///     Set a drag and drop handler function on a SerializedObject's ReorderableList, if any
+        /// </summary>
+        /// <param name="property"></param>
+        /// <param name="handler"></param>
+        /// <returns></returns>
+        protected bool SetDragDropHandler(SerializedProperty property, Action<SerializedProperty, Object[]> handler)
+        {
+            if (listIndex.Count == 0)
+            {
+                return false;
+            }
 
-				bool isStartProp = targetProp.propertyPath.StartsWith("m_");
-				using (new EditorGUI.DisabledScope(isStartProp))
-				{
-					EditorGUILayout.PropertyField(targetProp, targetProp.isExpanded);
-				}
-			}
-		}
+            var parent = GetGrandParentPath(property);
 
-		// Creates a new ScriptableObject via the default Save File panel
-		private ScriptableObject CreateAssetWithSavePrompt(Type type, string path)
-		{
-			path = EditorUtility.SaveFilePanelInProject("Save ScriptableObject", "New " + type.Name + ".asset", "asset", "Enter a file name for the ScriptableObject.", path);
-			if (path == "") return null;
-			ScriptableObject asset = ScriptableObject.CreateInstance(type);
-			AssetDatabase.CreateAsset(asset, path);
-			AssetDatabase.SaveAssets();
-			AssetDatabase.Refresh();
-			AssetDatabase.ImportAsset(path, ImportAssetOptions.ForceUpdate);
-			EditorGUIUtility.PingObject(asset);
-			return asset;
-		}
+            var data = listIndex.Find(listData => listData.Parent.Equals(parent));
 
-#region Helper functions
-		/// <summary>
-		/// Draw the default inspector, with the sortable arrays
-		/// </summary>
-		public void DrawPropertiesAll()
-		{
-			SerializedProperty iterProp = serializedObject.GetIterator();
-			IterateDrawProperty(iterProp);
-		}
+            if (data == null)
+            {
+                return false;
+            }
 
-		/// <summary>
-		/// Draw the default inspector, except for the given property names
-		/// </summary>
-		/// <param name="propertyNames"></param>
-		public void DrawPropertiesExcept(params string[] propertyNames)
-		{
-			SerializedProperty iterProp = serializedObject.GetIterator();
+            data.SetDropHandler(property, handler);
 
-			IterateDrawProperty(iterProp,
-				filter: () =>
-				{
-					if (propertyNames.Contains(iterProp.name))
-						return IterControl.Continue;
-					return IterControl.Draw;
-				});
-		}
+            return true;
+        }
 
-		/// <summary>
-		/// Draw the default inspector, starting from a given property
-		/// </summary>
-		/// <param name="propertyStart">Property name to start from</param>
-		public void DrawPropertiesFrom(string propertyStart)
-		{
-			bool canDraw = false;
-			SerializedProperty iterProp = serializedObject.GetIterator();
-			IterateDrawProperty(iterProp,
-				filter: () =>
-				{
-					if (iterProp.name.Equals(propertyStart))
-						canDraw = true;
-					if (canDraw)
-						return IterControl.Draw;
-					return IterControl.Continue;
-				});
-		}
+        #endregion
 
-		/// <summary>
-		/// Draw the default inspector, up to a given property
-		/// </summary>
-		/// <param name="propertyStop">Property name to stop at</param>
-		public void DrawPropertiesUpTo(string propertyStop)
-		{
-			SerializedProperty iterProp = serializedObject.GetIterator();
-			IterateDrawProperty(iterProp,
-				filter: () =>
-				{
-					if (iterProp.name.Equals(propertyStop))
-						return IterControl.Break;
-					return IterControl.Draw;
-				});
-		}
+        #region Helper functions
 
-		/// <summary>
-		/// Draw the default inspector, starting from a given property to a stopping property
-		/// </summary>
-		/// <param name="propertyStart">Property name to start from</param>
-		/// <param name="propertyStop">Property name to stop at</param>
-		public void DrawPropertiesFromUpTo(string propertyStart, string propertyStop)
-		{
-			bool canDraw = false;
-			SerializedProperty iterProp = serializedObject.GetIterator();
-			IterateDrawProperty(iterProp,
-				filter: () =>
-				{
-					if (iterProp.name.Equals(propertyStop))
-						return IterControl.Break;
+        /// <summary>
+        ///     Draw the default inspector, with the sortable arrays
+        /// </summary>
+        public void DrawPropertiesAll()
+        {
+            var iterProp = serializedObject.GetIterator();
+            IterateDrawProperty(iterProp);
+        }
 
-					if (iterProp.name.Equals(propertyStart))
-						canDraw = true;
 
-					if (canDraw == false)
-						return IterControl.Continue;
+        /// <summary>
+        ///     Draw the default inspector, except for the given property names
+        /// </summary>
+        /// <param name="propertyNames"></param>
+        public void DrawPropertiesExcept(params string[] propertyNames)
+        {
+            var iterProp = serializedObject.GetIterator();
 
-					return IterControl.Draw;
-				});
-		}
+            IterateDrawProperty(iterProp,
+                () =>
+                {
+                    if (propertyNames.Contains(iterProp.name))
+                    {
+                        return IterControl.Continue;
+                    }
 
-		public void DrawContextMenuButtons()
-		{
-			if (contextData.Count == 0) return;
+                    return IterControl.Draw;
+                });
+        }
 
-			EditorGUILayout.Space();
-			EditorGUILayout.LabelField("Context Menu", EditorStyles.boldLabel);
-			foreach (KeyValuePair<string, ContextMenuData> kv in contextData)
-			{
-				bool enabledState = GUI.enabled;
-				bool isEnabled = true;
-				if (kv.Value.validate != null)
-					isEnabled = (bool)kv.Value.validate.Invoke(target, null);
 
-				GUI.enabled = isEnabled;
-				if (GUILayout.Button(kv.Key) && kv.Value.function != null)
-				{
-					kv.Value.function.Invoke(target, null);
-				}
-				GUI.enabled = enabledState;
-			}
-		}
-#endregion
-	}
+        /// <summary>
+        ///     Draw the default inspector, starting from a given property
+        /// </summary>
+        /// <param name="propertyStart">Property name to start from</param>
+        public void DrawPropertiesFrom(string propertyStart)
+        {
+            var canDraw = false;
+            var iterProp = serializedObject.GetIterator();
+
+            IterateDrawProperty(iterProp,
+                () =>
+                {
+                    if (iterProp.name.Equals(propertyStart))
+                    {
+                        canDraw = true;
+                    }
+
+                    if (canDraw)
+                    {
+                        return IterControl.Draw;
+                    }
+
+                    return IterControl.Continue;
+                });
+        }
+
+
+        /// <summary>
+        ///     Draw the default inspector, up to a given property
+        /// </summary>
+        /// <param name="propertyStop">Property name to stop at</param>
+        public void DrawPropertiesUpTo(string propertyStop)
+        {
+            var iterProp = serializedObject.GetIterator();
+
+            IterateDrawProperty(iterProp,
+                () =>
+                {
+                    if (iterProp.name.Equals(propertyStop))
+                    {
+                        return IterControl.Break;
+                    }
+
+                    return IterControl.Draw;
+                });
+        }
+
+
+        /// <summary>
+        ///     Draw the default inspector, starting from a given property to a stopping property
+        /// </summary>
+        /// <param name="propertyStart">Property name to start from</param>
+        /// <param name="propertyStop">Property name to stop at</param>
+        public void DrawPropertiesFromUpTo(string propertyStart, string propertyStop)
+        {
+            var canDraw = false;
+            var iterProp = serializedObject.GetIterator();
+
+            IterateDrawProperty(iterProp,
+                () =>
+                {
+                    if (iterProp.name.Equals(propertyStop))
+                    {
+                        return IterControl.Break;
+                    }
+
+                    if (iterProp.name.Equals(propertyStart))
+                    {
+                        canDraw = true;
+                    }
+
+                    if (canDraw == false)
+                    {
+                        return IterControl.Continue;
+                    }
+
+                    return IterControl.Draw;
+                });
+        }
+
+
+        public void DrawContextMenuButtons()
+        {
+            if (contextData.Count == 0)
+            {
+                return;
+            }
+
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Context Menu", EditorStyles.boldLabel);
+
+            foreach (var kv in contextData)
+            {
+                var enabledState = GUI.enabled;
+                var isEnabled = true;
+
+                if (kv.Value.validate != null)
+                {
+                    isEnabled = (bool) kv.Value.validate.Invoke(target, null);
+                }
+
+                GUI.enabled = isEnabled;
+
+                if (GUILayout.Button(kv.Key) && kv.Value.function != null)
+                {
+                    kv.Value.function.Invoke(target, null);
+                }
+
+                GUI.enabled = enabledState;
+            }
+        }
+
+        #endregion
+    }
 }
