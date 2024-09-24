@@ -32,12 +32,12 @@ namespace SubjectNerd.Utilities
 {
     internal static class SerializedPropExtension
     {
-	    /// <summary>
-	    ///     Set isExpanded of the SerializedProperty and propogate the change up the hierarchy
-	    /// </summary>
-	    /// <param name="prop"></param>
-	    /// <param name="expand">isExpanded value</param>
-	    public static void ExpandHierarchy(this SerializedProperty prop, bool expand = true)
+        /// <summary>
+        ///     Set isExpanded of the SerializedProperty and propogate the change up the hierarchy
+        /// </summary>
+        /// <param name="prop"></param>
+        /// <param name="expand">isExpanded value</param>
+        public static void ExpandHierarchy(this SerializedProperty prop, bool expand = true)
         {
             prop.isExpanded = expand;
             var parent = GetParentProp(prop);
