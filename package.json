@@ -1,0 +1,19 @@
+{
+  "name": "com.jeielarana.reorderableinspector",
+  "version": "1.0.0",
+  "displayName": "Reorderable Inspector",
+  "description": " A package that provides a reorderable list for Unity's inspector.",
+  "unity": "2021.3",
+  "dependencies": {
+    
+  },
+  "keywords": [
+    "Unity",
+    "Inspector",
+    "Reorderable",
+    "List"
+  ],
+  "author": {
+    "name": "Jeiel Arana"
+  }
+}
