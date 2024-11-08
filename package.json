@@ -5,7 +5,6 @@
   "description": " A package that provides a reorderable list for Unity's inspector.",
   "unity": "2021.3",
   "dependencies": {
-    
   },
   "keywords": [
     "Unity",
